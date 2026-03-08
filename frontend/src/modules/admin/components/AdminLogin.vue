@@ -1,5 +1,6 @@
 <script setup>
-import { ref, reactive } from "vue";
+import { ref, reactive, nextTick } from "vue";
+import { useRouter } from "vue-router";
 import { useI18n } from "vue-i18n";
 import { ApiStatus } from "@/api/ApiStatus";
 import { useAuthStore } from "@/stores/authStore.js";
@@ -15,6 +16,7 @@ const props = defineProps({
 const emit = defineEmits(["login-success"]);
 const { t } = useI18n();
 const log = createLogger("AdminLogin");
+const router = useRouter();
 
 // 使用认证Store
 const authStore = useAuthStore();
@@ -31,6 +33,34 @@ const form = reactive({
 const apiKeyForm = reactive({
   apiKey: "",
 });
+
+const navigateAfterLogin = async (target) => {
+  const resolved = router.resolve(target);
+
+  try {
+    await router.replace(target);
+    await nextTick();
+
+    const currentRoute = router.currentRoute.value;
+    const reachedTarget =
+      currentRoute.fullPath === resolved.fullPath ||
+      currentRoute.path === resolved.path ||
+      (resolved.path === "/admin" && currentRoute.path.startsWith("/admin"));
+
+    if (reachedTarget) {
+      return;
+    }
+
+    log.warn("登录后 SPA 跳转未生效，回退到整页跳转", {
+      expected: resolved.fullPath,
+      actual: currentRoute.fullPath,
+    });
+  } catch (error) {
+    log.warn("登录后路由跳转失败，回退到整页跳转", error);
+  }
+
+  window.location.assign(resolved.fullPath);
+};
 
 const toggleLoginMode = () => {
   isApiKeyMode.value = !isApiKeyMode.value;
@@ -59,6 +89,8 @@ const handleLogin = async () => {
       token: result.data.token,
       type: "admin",
     });
+
+    await navigateAfterLogin("/admin");
   } catch (err) {
     log.error("管理员登录失败:", err);
     // 优先使用HTTP状态码判断错误类型，更可靠
@@ -97,6 +129,8 @@ const handleApiKeyLogin = async () => {
       keyInfo: result.data.key_info,
       type: "apikey",
     });
+
+    await navigateAfterLogin("/admin");
   } catch (err) {
     log.error("API密钥验证失败:", err);
     // 优先使用HTTP状态码判断错误类型，更可靠

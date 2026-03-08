@@ -1,5 +1,5 @@
 <script setup>
-import { ref, reactive, onMounted } from "vue";
+import { ref, reactive, onMounted, nextTick } from "vue";
 import { useLocalStorage } from "@vueuse/core";
 import { useRouter } from "vue-router";
 import { useI18n } from "vue-i18n";
@@ -81,6 +81,34 @@ const saveRemembered = (mode) => {
   }
 };
 
+const navigateAfterLogin = async (target) => {
+  const resolved = router.resolve(target);
+
+  try {
+    await router.replace(target);
+    await nextTick();
+
+    const currentRoute = router.currentRoute.value;
+    const reachedTarget =
+      currentRoute.fullPath === resolved.fullPath ||
+      currentRoute.path === resolved.path ||
+      (resolved.path === "/admin" && currentRoute.path.startsWith("/admin"));
+
+    if (reachedTarget) {
+      return;
+    }
+
+    log.warn("登录后 SPA 跳转未生效，回退到整页跳转", {
+      expected: resolved.fullPath,
+      actual: currentRoute.fullPath,
+    });
+  } catch (error) {
+    log.warn("登录后路由跳转失败，回退到整页跳转", error);
+  }
+
+  window.location.assign(resolved.fullPath);
+};
+
 const handleLogin = async () => {
   if (isApiKeyMode.value) {
     return handleApiKeyLogin();
@@ -100,11 +128,11 @@ const handleLogin = async () => {
 
     // 登录成功，智能重定向到合适的管理页面
     const redirectQuery = router.currentRoute.value.query.redirect;
-    if (redirectQuery) {
-      router.push(redirectQuery);
+    if (typeof redirectQuery === "string" && redirectQuery.trim()) {
+      await navigateAfterLogin(redirectQuery);
     } else {
       // 没有指定重定向路径，使用智能重定向
-      router.push("/admin");
+      await navigateAfterLogin("/admin");
     }
   } catch (err) {
     log.error("管理员登录失败:", err);
@@ -135,11 +163,11 @@ const handleApiKeyLogin = async () => {
 
     // 登录成功，智能重定向到合适的管理页面
     const redirectQuery = router.currentRoute.value.query.redirect;
-    if (redirectQuery) {
-      router.push(redirectQuery);
+    if (typeof redirectQuery === "string" && redirectQuery.trim()) {
+      await navigateAfterLogin(redirectQuery);
     } else {
       // 没有指定重定向路径，使用智能重定向
-      router.push("/admin");
+      await navigateAfterLogin("/admin");
     }
   } catch (err) {
     log.error("API密钥验证失败:", err);
@@ -171,9 +199,9 @@ const handleGuestLogin = async () => {
 
     const redirectQuery = router.currentRoute.value.query.redirect;
     if (typeof redirectQuery === "string" && redirectQuery.startsWith("/mount-explorer")) {
-      router.push(redirectQuery);
+      await navigateAfterLogin(redirectQuery);
     } else {
-      router.push({ name: "MountExplorer" });
+      await navigateAfterLogin({ name: "MountExplorer" });
     }
   } catch (err) {
     log.error("游客登录失败:", err);
