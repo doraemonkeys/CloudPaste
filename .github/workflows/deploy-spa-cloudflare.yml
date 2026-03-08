@@ -141,6 +141,7 @@ jobs:
           if [ -n "$EXISTING_DB" ]; then
             echo "✅ 找到现有 D1 数据库: $EXISTING_DB"
             DATABASE_ID=$EXISTING_DB
+            DATABASE_CREATED=false
           else
             echo "创建新的 D1 数据库..."
             CREATE_OUTPUT=$(npx wrangler d1 create cloudpaste-db 2>&1)
@@ -151,6 +152,7 @@ jobs:
                 DATABASE_ID=$(echo "$CREATE_OUTPUT" | grep -oP "([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})")
               fi
               echo "✅ 数据库创建成功: $DATABASE_ID"
+              DATABASE_CREATED=true
             else
               LIST_OUTPUT=$(npx wrangler d1 list --json 2>/dev/null || echo "[]")
               DATABASE_ID=$(echo "$LIST_OUTPUT" | jq -r '.[] | select(.name=="cloudpaste-db") | .uuid')
@@ -159,6 +161,8 @@ jobs:
                 echo "❌ 无法创建或找到 D1 数据库"
                 exit 1
               fi
+
+              DATABASE_CREATED=false
             fi
           fi
 
@@ -175,6 +179,7 @@ jobs:
           fi
 
           echo "database_id=$DATABASE_ID" >> $GITHUB_ENV
+          echo "database_created=$DATABASE_CREATED" >> $GITHUB_ENV
 
       - name: Initialize D1 Database schema
         working-directory: ./backend
@@ -182,8 +187,12 @@ jobs:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: |
-          echo "初始化数据库表结构..."
-          npx wrangler d1 execute cloudpaste-db --file=./schema.sql || echo "⚠️ 表可能已存在，继续部署"
+          if [ "$database_created" = "true" ]; then
+            echo "检测到新建数据库，执行 schema.sql bootstrap..."
+            npx wrangler d1 execute cloudpaste-db --file=./schema.sql
+          else
+            echo "检测到已有数据库，跳过 schema.sql，交给运行时迁移处理升级"
+          fi
 
       # ==================== 步骤 4：环境变量（优先级：Worker现有 -> GitHub -> wrangler配置） ====================
       - name: Resolve ENCRYPTION_SECRET for deploy

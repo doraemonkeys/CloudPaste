@@ -48,18 +48,23 @@ export default {
     // - 纯新库（无表） => needsTablesCreation=true
     // - 仅有 schema（例如用 schema.sql 手工创建了表，但无数据）=> isExistingDb=false
     // - 老库（有业务数据）=> isExistingDb=true 且通常 needsTablesCreation=false
-    if (needsTablesCreation || !isExistingDb) {
+    const { capVersion, shouldSquashToLatest } = computeAdoptPlan({
+      legacyVersion,
+      hasAppTables: existingAppTables.length > 0,
+    });
+
+    // 仅对“完全没有任何业务表”的真新库执行 bootstrap。
+    // 旧库即使没有业务数据、或缺少部分新表，也必须交给 app-vXX 链逐步修复，
+    // 否则 initDatabase() 内部的 IF NOT EXISTS + 建索引逻辑会把旧表误当成新表，
+    // 在缺列时提前报错，导致真正的历史迁移根本没有机会执行。
+    if (shouldSquashToLatest) {
       await initDatabase(db);
     }
 
     // adopt 标记范围：
     // - 旧库：按 legacy schema_version（上限为当前应用版本）
-    // - 仅在“完全没有任何业务表”的真新库场景下，才允许直接 squash 到当前版本。
-    //   否则即便缺表/缺数据，也必须保留历史迁移回放机会，避免旧表被错误视为最终态。
-    const { capVersion } = computeAdoptPlan({
-      legacyVersion,
-      hasAppTables: existingAppTables.length > 0,
-    });
+    // - 真新库：bootstrap 到最终态后直接 squash 到当前版本
+    // - 旧 schema / 空数据旧库：不做 squash，保留历史迁移回放机会
 
     if (capVersion <= 0) {
       // 老库/旧 schema 在缺失 legacy schema_version 时，不做 squash 标记。
