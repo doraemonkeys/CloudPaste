@@ -3,23 +3,33 @@ import { LegacyDbTables } from "./legacyKeys.js";
 import { StorageFactory } from "../../../../storage/factory/StorageFactory.js";
 import { toBool } from "../../../../utils/environmentUtils.js";
 import {
+  createAdminTables,
+  createFileTables,
   createFsMetaTables,
   createFsSearchIndexTables,
+  createIndexes,
+  createMigrationTables,
   createScheduledJobRunsTables,
   createScheduledJobsTables,
+  createStorageTables,
+  createSystemTables,
   createTasksTables,
   createUploadPartsTables,
   createUploadSessionsTables,
   createVfsTables,
   createMetricsCacheTables,
+  createPasteTables,
 } from "./schema.js";
 import {
+  addDefaultProxySetting,
   addCustomContentSettings,
   addFileNamingStrategySetting,
   addPreviewSettings,
   resetPreviewProvidersDefaults,
   addSiteSettings,
+  createDefaultAdmin,
   createDefaultGuestApiKey,
+  initDefaultSettings,
 } from "./seed.js";
 
 /**
@@ -117,6 +127,221 @@ async function normalizeStorageConfigsBooleanFields(db) {
 
   console.log("版本34：storage_configs 布尔字段归一化完成：", { total: rows.length, updated, skipped, failed });
   return { total: rows.length, updated, skipped, failed };
+}
+
+async function tableExists(db, tableName) {
+  try {
+    const row = await db
+      .prepare(`SELECT 1 AS ok FROM sqlite_master WHERE type='table' AND name = ?`)
+      .bind(tableName)
+      .first();
+    return !!row;
+  } catch {
+    return false;
+  }
+}
+
+async function getTableColumnSet(db, tableName) {
+  try {
+    const columnInfo = await db.prepare(`PRAGMA table_info(${tableName})`).all();
+    const rows = Array.isArray(columnInfo?.results) ? columnInfo.results : [];
+    return new Set(rows.map((column) => column?.name).filter(Boolean));
+  } catch {
+    return new Set();
+  }
+}
+
+async function runBestEffortStep(label, fn) {
+  try {
+    await fn();
+  } catch (error) {
+    console.warn(`${label} 失败，继续执行后续修复：`, error?.message || error);
+  }
+}
+
+async function ensureStorageConfigsTableAndMigrateLegacyS3Configs(db) {
+  await db
+    .prepare(
+      `
+      CREATE TABLE IF NOT EXISTS ${DbTables.STORAGE_CONFIGS} (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        storage_type TEXT NOT NULL,
+        admin_id TEXT,
+        is_public INTEGER NOT NULL DEFAULT 0,
+        is_default INTEGER NOT NULL DEFAULT 0,
+        remark TEXT,
+        status TEXT NOT NULL DEFAULT 'ENABLED',
+        config_json TEXT NOT NULL,
+        created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        last_used DATETIME
+      )
+    `,
+    )
+    .run();
+
+  await db.prepare(`CREATE INDEX IF NOT EXISTS idx_storage_admin ON ${DbTables.STORAGE_CONFIGS}(admin_id)`).run();
+  await db.prepare(`CREATE INDEX IF NOT EXISTS idx_storage_type ON ${DbTables.STORAGE_CONFIGS}(storage_type)`).run();
+  await db.prepare(`CREATE INDEX IF NOT EXISTS idx_storage_public ON ${DbTables.STORAGE_CONFIGS}(is_public)`).run();
+  await db
+    .prepare(
+      `CREATE UNIQUE INDEX IF NOT EXISTS idx_default_per_admin
+       ON ${DbTables.STORAGE_CONFIGS}(admin_id)
+       WHERE is_default = 1`,
+    )
+    .run();
+
+  await db
+    .prepare(
+      `
+      INSERT OR IGNORE INTO ${DbTables.STORAGE_CONFIGS} (
+        id, name, storage_type, admin_id, is_public, is_default, remark, status,
+        config_json, created_at, updated_at, last_used
+      )
+      SELECT
+        s.id,
+        s.name,
+        'S3' AS storage_type,
+        s.admin_id,
+        COALESCE(s.is_public, 0),
+        COALESCE(s.is_default, 0),
+        NULL AS remark,
+        'ENABLED' AS status,
+        json_object(
+          'provider_type', s.provider_type,
+          'endpoint_url', s.endpoint_url,
+          'bucket_name', s.bucket_name,
+          'region', s.region,
+          'path_style', s.path_style,
+          'default_folder', s.default_folder,
+          'custom_host', s.custom_host,
+          'signature_expires_in', s.signature_expires_in,
+          'total_storage_bytes', s.total_storage_bytes,
+          'access_key_id', s.access_key_id,
+          'secret_access_key', s.secret_access_key
+        ) AS config_json,
+        s.created_at,
+        s.updated_at,
+        s.last_used
+      FROM ${LegacyDbTables.S3_CONFIGS} s
+      WHERE NOT EXISTS (
+        SELECT 1 FROM ${DbTables.STORAGE_CONFIGS} t WHERE t.id = s.id
+      )
+    `,
+    )
+    .run()
+    .catch((error) => {
+      console.warn("迁移 s3_configs -> storage_configs 失败，将跳过数据导入：", error?.message || error);
+    });
+}
+
+async function needsFilesTableMultiStorageRepair(db) {
+  if (!(await tableExists(db, DbTables.FILES))) {
+    return false;
+  }
+
+  const existingColumns = await getTableColumnSet(db, DbTables.FILES);
+  if (!existingColumns.size) {
+    return false;
+  }
+
+  return (
+    existingColumns.has("s3_config_id") ||
+    !existingColumns.has("storage_config_id") ||
+    !existingColumns.has("storage_type") ||
+    !existingColumns.has("file_path")
+  );
+}
+
+async function ensureSchemaScaffoldForRepair(db) {
+  await createAdminTables(db);
+  await createStorageTables(db);
+  await createFileTables(db);
+  await createMigrationTables(db);
+  await createSystemTables(db);
+  await createFsMetaTables(db);
+  await createTasksTables(db);
+  await createScheduledJobsTables(db);
+  await createScheduledJobRunsTables(db);
+  await createUploadSessionsTables(db);
+  await createVfsTables(db);
+  await createMetricsCacheTables(db);
+  await createUploadPartsTables(db);
+
+  if (!(await tableExists(db, DbTables.PASTES))) {
+    await createPasteTables(db);
+  }
+
+  await runBestEffortStep("创建 FS 搜索索引表", async () => {
+    await createFsSearchIndexTables(db);
+  });
+}
+
+export async function repairSkippedLegacySchemaMigrations(db) {
+  console.log("版本35：开始修复被错误 adopt 标记跳过的历史 schema 迁移...");
+
+  await ensureSchemaScaffoldForRepair(db);
+
+  await migrateSystemSettingsStructure(db);
+  await initDefaultSettings(db);
+  await addPreviewSettings(db);
+  await addSiteSettings(db);
+  await addCustomContentSettings(db);
+  await addFileNamingStrategySetting(db);
+  await addDefaultProxySetting(db);
+
+  await ensureStorageConfigsTableAndMigrateLegacyS3Configs(db);
+  await addTableField(db, DbTables.STORAGE_CONFIGS, "url_proxy", "url_proxy TEXT");
+
+  await addTableField(db, DbTables.PASTES, "title", "title TEXT");
+  await addTableField(db, DbTables.PASTES, "is_public", "is_public BOOLEAN NOT NULL DEFAULT 1");
+  await createPasteTables(db);
+
+  if (await needsFilesTableMultiStorageRepair(db)) {
+    await migrateFilesTableToMultiStorage(db);
+  }
+
+  await migrateToBitFlagPermissions(db);
+  await migrateApiKeysIsGuestToIsEnable(db);
+  await addTableField(db, DbTables.API_KEYS, "basic_path", "basic_path TEXT DEFAULT '/'");
+
+  await addTableField(db, DbTables.STORAGE_MOUNTS, "web_proxy", "web_proxy BOOLEAN DEFAULT 0");
+  await addTableField(db, DbTables.STORAGE_MOUNTS, "webdav_policy", "webdav_policy TEXT DEFAULT '302_redirect'");
+  await addTableField(db, DbTables.STORAGE_MOUNTS, "enable_sign", "enable_sign BOOLEAN DEFAULT 0");
+  await addTableField(db, DbTables.STORAGE_MOUNTS, "sign_expires", "sign_expires INTEGER DEFAULT NULL");
+  await addTableField(
+    db,
+    DbTables.STORAGE_MOUNTS,
+    "enable_folder_summary_compute",
+    "enable_folder_summary_compute BOOLEAN DEFAULT 0",
+  );
+
+  await addTableField(db, DbTables.TASKS, "trigger_type", "trigger_type TEXT NOT NULL DEFAULT 'manual'");
+  await addTableField(db, DbTables.TASKS, "trigger_ref", "trigger_ref TEXT");
+
+  await runBestEffortStep("统一 upload_sessions.status 状态值", async () => {
+    await db
+      .prepare(
+        `UPDATE ${DbTables.UPLOAD_SESSIONS}
+         SET status = CASE
+           WHEN (bytes_uploaded > 0)
+             OR (uploaded_parts > 0)
+             OR (next_expected_range IS NOT NULL AND next_expected_range != '')
+           THEN 'uploading'
+           ELSE 'initiated'
+         END
+         WHERE status = 'active'`,
+      )
+      .run();
+  });
+
+  await createDefaultAdmin(db);
+  await createDefaultGuestApiKey(db);
+  await createIndexes(db);
+  await normalizeStorageConfigsBooleanFields(db);
+
+  console.log("版本35：历史 schema 修复完成。");
 }
 
 export async function addTableField(db, tableName, fieldName, fieldDefinition) {
@@ -558,82 +783,7 @@ export async function runLegacyMigrationByVersion(db, version) {
     case 18: {
       console.log("版本18：创建 storage_configs 表并迁移 s3_configs 数据...");
 
-      await db
-        .prepare(
-          `
-          CREATE TABLE IF NOT EXISTS ${DbTables.STORAGE_CONFIGS} (
-            id TEXT PRIMARY KEY,
-            name TEXT NOT NULL,
-            storage_type TEXT NOT NULL,
-            admin_id TEXT,
-            is_public INTEGER NOT NULL DEFAULT 0,
-            is_default INTEGER NOT NULL DEFAULT 0,
-            remark TEXT,
-            status TEXT NOT NULL DEFAULT 'ENABLED',
-            config_json TEXT NOT NULL,
-            created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            last_used DATETIME
-          )
-        `,
-        )
-        .run();
-
-      await db.prepare(`CREATE INDEX IF NOT EXISTS idx_storage_admin ON ${DbTables.STORAGE_CONFIGS}(admin_id)`).run();
-      await db.prepare(`CREATE INDEX IF NOT EXISTS idx_storage_type ON ${DbTables.STORAGE_CONFIGS}(storage_type)`).run();
-      await db.prepare(`CREATE INDEX IF NOT EXISTS idx_storage_public ON ${DbTables.STORAGE_CONFIGS}(is_public)`).run();
-      await db
-        .prepare(
-          `CREATE UNIQUE INDEX IF NOT EXISTS idx_default_per_admin
-           ON ${DbTables.STORAGE_CONFIGS}(admin_id)
-           WHERE is_default = 1`,
-        )
-        .run();
-
-      await db
-        .prepare(
-          `
-          INSERT OR IGNORE INTO ${DbTables.STORAGE_CONFIGS} (
-            id, name, storage_type, admin_id, is_public, is_default, remark, status,
-            config_json, created_at, updated_at, last_used
-          )
-          SELECT
-            s.id,
-            s.name,
-            'S3' AS storage_type,
-            s.admin_id,
-            COALESCE(s.is_public, 0),
-            COALESCE(s.is_default, 0),
-            NULL AS remark,
-            'ENABLED' AS status,
-            json_object(
-              'provider_type', s.provider_type,
-              'endpoint_url', s.endpoint_url,
-              'bucket_name', s.bucket_name,
-              'region', s.region,
-              'path_style', s.path_style,
-              'default_folder', s.default_folder,
-              'custom_host', s.custom_host,
-              'signature_expires_in', s.signature_expires_in,
-              'total_storage_bytes', s.total_storage_bytes,
-              'access_key_id', s.access_key_id,
-              'secret_access_key', s.secret_access_key
-            ) AS config_json,
-            s.created_at,
-            s.updated_at,
-            s.last_used
-          FROM ${LegacyDbTables.S3_CONFIGS} s
-          WHERE NOT EXISTS (
-            SELECT 1 FROM ${DbTables.STORAGE_CONFIGS} t WHERE t.id = s.id
-          )
-        `,
-        )
-        .run()
-        .catch((error) => {
-          // 兼容：若旧库中不存在 s3_configs（或已清理），跳过数据迁移但保留新表结构。
-          // 这能避免“全新库/已升级库”在误触发旧迁移时直接失败。
-          console.warn("版本18：迁移 s3_configs -> storage_configs 失败，将跳过数据迁移：", error?.message || error);
-        });
+      await ensureStorageConfigsTableAndMigrateLegacyS3Configs(db);
 
       console.log("版本18：storage_configs 表与数据迁移完成。");
       break;
@@ -828,6 +978,10 @@ export async function runLegacyMigrationByVersion(db, version) {
 
       break;
     }
+
+    case 35:
+      await repairSkippedLegacySchemaMigrations(db);
+      break;
 
     default:
       console.log(`未知的迁移版本: ${version}`);

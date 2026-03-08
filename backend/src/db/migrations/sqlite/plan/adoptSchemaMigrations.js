@@ -1,12 +1,13 @@
 import { DbTables } from "../../../../constants/index.js";
 import {
+  computeAdoptPlan,
   deleteLegacySchemaKeysFromSystemSettings,
+  getExistingAppTables,
   getExistingTableSet,
   getLegacySchemaVersionFromSystemSettings,
   looksLikeExistingDatabase,
   makeVersionMigrationId,
   markMigrationsApplied,
-  APP_SCHEMA_VERSION,
   REQUIRED_TABLES,
 } from "./adoptUtils.js";
 import { initDatabase } from "../engine/initDatabase.js";
@@ -18,6 +19,7 @@ export default {
   id: ADOPT_ID,
   async up({ db }) {
     const existingTables = await getExistingTableSet(db);
+    const existingAppTables = getExistingAppTables(existingTables);
     const hasSystemSettings = existingTables.has(DbTables.SYSTEM_SETTINGS);
 
     // 若已执行过 adopt，则直接退出
@@ -52,17 +54,16 @@ export default {
 
     // adopt 标记范围：
     // - 旧库：按 legacy schema_version（上限为当前应用版本）
-    // - 新库/缺表库：按当前应用版本（已初始化到最终态）
-    const capVersion =
-      legacyVersion > 0
-        ? Math.min(legacyVersion, APP_SCHEMA_VERSION)
-        : needsTablesCreation || !isExistingDb
-          ? APP_SCHEMA_VERSION
-          : 0;
+    // - 仅在“完全没有任何业务表”的真新库场景下，才允许直接 squash 到当前版本。
+    //   否则即便缺表/缺数据，也必须保留历史迁移回放机会，避免旧表被错误视为最终态。
+    const { capVersion } = computeAdoptPlan({
+      legacyVersion,
+      hasAppTables: existingAppTables.length > 0,
+    });
 
     if (capVersion <= 0) {
-      // 极少数情况：老库存在业务数据，但缺失 schema_version，无法安全推断版本。
-      // 这里不做 squash 标记，避免错误接管。
+      // 老库/旧 schema 在缺失 legacy schema_version 时，不做 squash 标记。
+      // 后续由 app-vXX 链按顺序补齐真正缺失的历史迁移。
       return false;
     }
     const ids = [];

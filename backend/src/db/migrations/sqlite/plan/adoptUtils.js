@@ -7,6 +7,7 @@ export const MIGRATIONS_TABLE = "schema_migrations";
 // adopt 阶段用于“缺表判定”的表集合：
 // - 以 `DbTables` 作为单一事实来源
 export const REQUIRED_TABLES = Array.from(new Set([...Object.values(DbTables), MIGRATIONS_TABLE]));
+export const APP_TABLES = Array.from(new Set(Object.values(DbTables).filter((name) => name && name !== MIGRATIONS_TABLE)));
 
 export { APP_SCHEMA_VERSION };
 
@@ -14,6 +15,11 @@ export async function getExistingTableSet(db) {
   const existingTables = await db.prepare(`SELECT name FROM sqlite_master WHERE type='table'`).all();
   const rows = existingTables?.results || [];
   return new Set(rows.map((t) => t.name).filter(Boolean));
+}
+
+export function getExistingAppTables(existingTables) {
+  const tableSet = existingTables instanceof Set ? existingTables : new Set();
+  return APP_TABLES.filter((tableName) => tableSet.has(tableName));
 }
 
 async function tableHasAnyRow(db, tableName) {
@@ -34,6 +40,24 @@ export async function looksLikeExistingDatabase(db, existingTables) {
     if (await tableHasAnyRow(db, tableName)) return true;
   }
   return false;
+}
+
+export function computeAdoptPlan({ legacyVersion = 0, hasAppTables = false, appSchemaVersion = APP_SCHEMA_VERSION } = {}) {
+  const normalizedLegacyVersion = Number.isFinite(legacyVersion) ? Math.max(0, Number(legacyVersion)) : 0;
+  const normalizedSchemaVersion = Number.isFinite(appSchemaVersion) ? Math.max(0, Number(appSchemaVersion)) : APP_SCHEMA_VERSION;
+  const shouldSquashToLatest = !hasAppTables;
+
+  const capVersion =
+    normalizedLegacyVersion > 0
+      ? Math.min(normalizedLegacyVersion, normalizedSchemaVersion)
+      : shouldSquashToLatest
+        ? normalizedSchemaVersion
+        : 0;
+
+  return {
+    shouldSquashToLatest,
+    capVersion,
+  };
 }
 
 export function makeVersionMigrationId(version) {
